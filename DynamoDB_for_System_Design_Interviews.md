@@ -4,8 +4,6 @@
 
 Beginner-friendly notes with simple examples, memory tricks, diagrams, and interview revision.
 
-The supplied AlgoMaster page highlights an important design rule: start with the application's read and write patterns, not just its business entities. Its detailed chapter is premium-only, so these notes explain the topic independently and use AWS documentation to verify technical details.
-
 ## 1. What is DynamoDB?
 
 Amazon DynamoDB is a fully managed NoSQL database on AWS. It supports key-value and document data models.
