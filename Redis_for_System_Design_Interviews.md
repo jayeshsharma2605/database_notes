@@ -2,282 +2,427 @@
 
 > Distributed Systems Study Library · Author: Jayesh Sharma
 
-Redis is a strong fit when a system needs low-latency shared state: caches, sessions, rate limiters, leaderboards, and small pieces of real-time application state. The important interview question is not simply “Why Redis is fast?” but **which Redis feature matches the access pattern, and what trade-off does the design accept?**
+Redis is an **in-memory data store**. It keeps frequently used data in RAM so applications can read and update it quickly.
 
-## 1. Redis at a glance
+Think of Redis as a **fast helper beside your main database**:
 
-Redis keeps its working data in memory and offers structures such as Strings, Lists, Sets, Sorted Sets, Hashes, HyperLogLog, and Streams. Many commands are O(1) or O(log N), depending on the operation and data structure.
+- Database: keeps the permanent, complete record.
+- Redis: keeps data that the application needs quickly.
 
-```mermaid
-flowchart TB
-    C[Client applications] --> P[Redis primary]
-    P --> RAM[In-memory data structures]
-    P --> R1[Replica 1]
-    P --> R2[Replica 2]
-    P --> D[RDB snapshots]
-    P --> A[AOF write log]
-    R1 -. replication stream .-> P
-    R2 -. replication stream .-> P
-    RAM --> S[String / Hash / List]
-    RAM --> Z[Set / Sorted Set]
-    RAM --> ST[Stream]
-```
+Common uses: caching, sessions, counters, rate limiting, leaderboards, and short-lived application state.
 
-The primary commonly processes commands through an event loop, multiplexing many client connections and executing commands sequentially. Redis also supports threaded I/O in some configurations and versions; avoid oversimplifying this as “Redis is entirely single-threaded.”
-
-**Trade-off:** in-memory speed costs RAM. Persistence and replication improve recovery and availability, but do not automatically make Redis equivalent to a strongly durable primary database.
-
-## 2. When to choose Redis
-
-| Requirement | Why Redis can fit |
-|---|---|
-| Low latency | Working set is in memory |
-| Frequently read data | Cache reduces database work |
-| Rate limiting | Atomic increments and TTL |
-| Rankings | Sorted Sets maintain score order |
-| Sessions | Fast key lookup and expiration |
-| Broadcast updates | Pub/Sub delivers to active subscribers |
-| Coordination | Atomic commands/scripts can implement limited coordination patterns |
-
-Redis is a weaker fit for ad-hoc queries, joins, complex relationships, data that cannot fit in memory, or critical records that must not be lost. Keep a durable database as the source of truth when appropriate; use Redis as a cache or derived-state store.
-
-```mermaid
-flowchart TD
-    Q[Does the workload need very low latency?] -->|No| DB[Consider a disk-based database]
-    Q -->|Yes| M[Does the working set fit in memory?]
-    M -->|No| DB
-    M -->|Yes| C[Are flexible queries or relationships required?]
-    C -->|Yes| DB
-    C -->|No| R[Redis may be a good fit]
-```
-
-## 3. Core data structures
-
-| Structure | Good fit | Typical operation characteristics |
-|---|---|---|
-| String | Cache value, counter, token | GET/SET and INCR typically O(1) |
-| Hash | Object fields, profile/session attributes | Single-field access typically O(1); HGETALL is O(N) |
-| List | FIFO queue, recent items | Push/pop at ends typically O(1); index access O(N) |
-| Set | Unique items, membership, intersections | Add/remove/check typically O(1); full enumeration O(N) |
-| Sorted Set | Leaderboard, ranked/time-scored items | Add/rank O(log N); range query O(log N + M) |
-| HyperLogLog | Approximate distinct count | Fixed-size structure (about 12 KB); standard error about 0.81% |
-| Stream | Retained event log and consumer groups | Append/read entries with IDs and consumer-group acknowledgments |
-| Pub/Sub | Live broadcast | Fire-and-forget; no persistence or replay |
-
-```mermaid
-flowchart TD
-    A[What are you building?] --> B[Simple cache or counter]
-    A --> C[Object fields]
-    A --> D[Queue or stack]
-    A --> E[Unique members]
-    A --> F[Ranking]
-    A --> G[Approximate distinct count]
-    A --> H[Retained event log]
-    B --> S[String]
-    C --> HS[Hash]
-    D --> L[List]
-    E --> SET[Set]
-    F --> Z[Sorted Set]
-    G --> HP[HyperLogLog]
-    H --> ST[Stream]
-```
-
-Example interview framing: “I’ll use a Sorted Set for the leaderboard: player ID is the member, score is the sort score, and rank/range commands support top-N queries. I’ll monitor memory and hot-key pressure as it grows.”
-
-## 4. Persistence: RDB and AOF
-
-Redis data is in memory; persistence determines what can be recovered after restart.
-
-### RDB snapshots
-- Saves a point-in-time binary snapshot.
-- Useful for backups and relatively fast restarts.
-- May lose writes made after the last snapshot.
-- Snapshotting uses a child process and copy-on-write; fork cost and memory pressure can cause latency spikes.
-
-### AOF (Append-Only File)
-- Records write operations and replays them during recovery.
-- `appendfsync always`: stronger disk-flush behavior, typically slower.
-- `appendfsync everysec`: common compromise; roughly up to one second of writes may be lost in a crash.
-- `appendfsync no`: OS decides when to flush; least predictable durability.
-- AOF rewrite compacts history into commands that recreate current state.
-
-RDB and AOF can be combined: snapshot-like data supports faster loading, while subsequent AOF entries capture newer writes. Actual recovery and loss behavior depends on configuration and storage.
-
-| Strategy | Typical trade-off |
-|---|---|
-| No persistence | Fastest, all state lost on restart |
-| RDB | Fast recovery; may lose changes since snapshot |
-| AOF everysec | Better durability; possible ~1 second loss; replay may take longer |
-| AOF always | Stronger flush policy, higher write cost |
-| RDB + AOF | Balances recovery speed and durability |
+## 1. Redis in one picture
 
 ```mermaid
 flowchart LR
-    W[Write commands] --> MEM[Redis memory]
-    MEM --> RDB[RDB: periodic snapshot]
-    MEM --> AOF[AOF: append writes]
-    RDB --> REC[Recovery]
-    AOF --> REC
-    REC --> DATA[Reconstructed dataset]
+    APP[Application] -->|GET / SET| R[Redis]
+    R --> RAM[(Data in RAM)]
+    R -. optional backup .-> DISK[(RDB / AOF)]
+    R -. copies data .-> REPLICA[Replica]
+    APP -->|Permanent records| DB[(Main Database)]
 ```
 
-Choose persistence based on the consequence of losing data. A rebuildable cache can tolerate weaker persistence; irreplaceable financial/order data should not rely solely on Redis.
+**Remember:** RAM gives speed. Disk gives recovery. Replicas help availability. They solve different problems.
 
-## 5. Replication and high availability
+Redis processes commands quickly because its main data is in memory. Its command execution is largely single-threaded per shard, while modern Redis can use I/O threads for some network work. So avoid saying that every part of Redis is single-threaded.
 
-Redis primary-replica replication is normally asynchronous. The primary handles writes and streams updates to replicas. Replicas may serve reads, but can be stale due to replication lag. A primary failure before a write reaches a replica can result in that write being lost during failover.
+## 2. When should we use Redis?
 
-The `WAIT` command can wait for replicas to acknowledge prior writes, reducing some failover-loss risk, but it is not a full durable commit guarantee.
+Use Redis when the application needs:
 
-### Sentinel
-Sentinel monitors Redis nodes, coordinates failover, promotes a replica, and helps clients discover the current primary. Deploy multiple Sentinels (commonly 3 or 5) to make failure decisions.
+- **Fast reads:** cache product details or user profiles.
+- **Fast counters:** count views, likes, or API requests.
+- **Expiry:** automatically remove old sessions or cache entries.
+- **Ranking:** show top players or trending items.
+- **Shared temporary state:** share session or rate-limit data across app servers.
+
+Do not choose Redis as the only store when the data must be permanently safe, needs complex joins, or needs flexible queries. Keep important permanent records in a database.
+
+**Easy rule:** If data is frequently used, small enough for memory, and can be rebuilt or safely managed, Redis may be a good fit.
+
+## 3. Redis data structures — choose by the job
+
+| Need | Redis structure | Easy way to remember |
+|---|---|---|
+| One value or counter | String | A simple value |
+| Fields of one object | Hash | A small dictionary |
+| Ordered items / queue | List | Items in a line |
+| Unique items | Set | No duplicates |
+| Ranking / score order | Sorted Set | A scoreboard |
+| Approximate unique count | HyperLogLog | Count without storing every item |
+| Retained events | Stream | A small event log |
+| Live broadcast | Pub/Sub | Radio broadcast |
+
+### Simple examples
+
+- **String:** `user:42:name = "Asha"`
+- **Hash:** `user:42 = {name: "Asha", city: "Pune"}`
+- **List:** recent notifications or a simple queue.
+- **Set:** users who liked a post; a user appears only once.
+- **Sorted Set:** player IDs ordered by score.
+- **HyperLogLog:** estimate how many different visitors opened a website.
+- **Stream:** keep events so consumers can read and acknowledge them.
+- **Pub/Sub:** send a live message to subscribers who are connected now.
+
+**Memory trick:** Value, Object, Line, Unique, Ranking, Estimate, Event log, Broadcast.
+
+## 4. Expiry and TTL
+
+TTL means **Time To Live** — how long a key should live.
+
+Example: a login session may expire after 30 minutes.
+
+```text
+SET session:42 "user data"
+EXPIRE session:42 1800
+```
+
+After 1,800 seconds (30 minutes), Redis can remove the key automatically.
+
+TTL is useful for sessions, temporary codes, and cache entries. It is not a replacement for a deliberate data-retention policy.
+
+## 5. Persistence — what happens after restart?
+
+Redis works mainly in memory. If the server stops, memory is lost. Persistence saves data so Redis can rebuild it after restart.
+
+There are two main options:
+
+### RDB = Snapshot
+
+Redis saves a picture of the data at a point in time.
+
+- Good for backups and faster recovery.
+- Changes made after the last snapshot may be lost.
+- Creating snapshots can use extra CPU and memory.
+
+**Remember RDB as a photograph:** it shows the data at one moment.
+
+### AOF = Write log
+
+Redis records write commands in a file and replays them during recovery.
+
+- Usually loses less recent data than periodic snapshots.
+- Recovery can take longer because commands must be replayed.
+- The fsync setting controls how often data is flushed to disk.
+
+Common settings:
+
+| Setting | Simple meaning |
+|---|---|
+| `appendfsync always` | Flush every write; safer, slower |
+| `appendfsync everysec` | Flush about once per second; common compromise |
+| `appendfsync no` | Let the operating system decide; less predictable |
+
+With `everysec`, roughly the latest second of writes may be lost in a crash.
+
+**Remember:** RDB = snapshot. AOF = write history. Redis can use both.
 
 ```mermaid
 flowchart TD
-    S1[Sentinel 1] --- P[Redis primary]
-    S2[Sentinel 2] --- P
-    S3[Sentinel 3] --- P
-    P --> R1[Replica 1]
-    P --> R2[Replica 2]
-    S1 -->|Quorum / coordinated failover| R1
-    S2 -->|Promote selected replica| R1
-    R2 -->|Reconfigure to follow new primary| R1
+    W[Write command] --> M[Redis memory]
+    M --> R[RDB snapshot]
+    M --> A[AOF write log]
+    R --> REC[Restart / recovery]
+    A --> REC
+    REC --> DATA[Data loaded back into memory]
 ```
 
-Failover is not instantaneous. Applications should handle a brief period of failed or retried requests and use Sentinel-aware clients when applicable. Sessions may be recoverable through re-authentication; the consequence differs for every use case.
+Choose based on how much data loss your application can accept. For critical financial or order records, use a durable database as the source of truth rather than relying only on Redis.
 
-## 6. Redis Cluster and horizontal scaling
+## 6. Replication — keep copies of data
 
-Redis Cluster partitions the keyspace across **16,384 hash slots**. A key maps to a slot using CRC16 and modulo 16384; primaries own ranges of slots and may have replicas for failover.
+A primary handles writes. Replicas receive copies of the primary's data and can sometimes serve reads.
 
 ```mermaid
-flowchart TB
-    CL[Client] -->|Compute key slot| S[One of 16,384 slots]
-    S --> P1[Primary shard 1]
-    S --> P2[Primary shard 2]
-    S --> P3[Primary shard 3]
+flowchart TD
+    APP[Application] --> P[Primary]
+    P -->|Copies changes| R1[Replica 1]
+    P -->|Copies changes| R2[Replica 2]
+    APP -. optional read .-> R1
+    APP -. optional read .-> R2
+```
+
+Why use replicas?
+
+- Help serve more read traffic.
+- Keep copies that may be promoted if the primary fails.
+
+Important: replication is normally **asynchronous**. A replica may be slightly behind the primary. A read from a replica can therefore return old data. If the primary fails before a write is copied, that write may be lost during failover.
+
+**Remember:** Replication gives copies, not a guarantee that every write is safely stored everywhere.
+
+## 7. High availability — Sentinel
+
+Sentinel watches the primary and replicas. If the primary fails, Sentinel helps select and promote a replica.
+
+```mermaid
+flowchart TD
+    S[Sentinel monitors Redis] -->|Primary fails| F[Choose a replica]
+    F --> P[Promote replica as new primary]
+    P --> APP[Clients reconnect to new primary]
+```
+
+Use multiple Sentinel processes so one failed monitor does not make the decision alone. Three is a common small deployment.
+
+Failover takes time. Applications must be ready to retry requests and reconnect.
+
+**Remember Sentinel = monitor + failover.**
+
+## 8. Scaling data — Redis Cluster
+
+One Redis server has limited memory and processing capacity. Redis Cluster spreads keys across multiple primary nodes.
+
+Redis Cluster divides the keyspace into **16,384 hash slots**. Each primary owns some slots. A key is mapped to a slot, and the client sends the request to the node that owns it.
+
+```mermaid
+flowchart TD
+    C[Client with key] --> H[Calculate hash slot]
+    H --> P1[Primary 1: some slots]
+    H --> P2[Primary 2: some slots]
+    H --> P3[Primary 3: some slots]
     P1 --> R1[Replica 1]
     P2 --> R2[Replica 2]
     P3 --> R3[Replica 3]
 ```
 
-If a client contacts the wrong node, Redis can return a `MOVED` redirect. Smart clients cache slot-to-node mappings.
-
-### Hash tags and multi-key operations
-In Cluster, multi-key operations, transactions, and Lua scripts generally require all involved keys to be in the same slot. A hash tag—text inside braces—forces keys to hash using the tagged substring, e.g. `cart:{user42}:items` and `cart:{user42}:meta`.
-
-This enables same-slot atomic operations but can concentrate traffic if too many keys share one tag.
+If the client contacts the wrong node, Redis can reply with a `MOVED` redirect. Cluster-aware clients learn which node owns each slot.
 
 ### Sentinel vs Cluster
 
-| | Sentinel | Redis Cluster |
+| | Sentinel | Cluster |
 |---|---|---|
-| Primary goal | High availability | High availability plus horizontal scaling |
-| Data capacity | One primary’s memory | Aggregate memory across shards |
-| Multi-key operations | Broad single-node support | Generally same-slot only |
-| Complexity | Lower | Higher |
+| Main purpose | High availability | Sharding + high availability |
+| Splits data across primaries? | No | Yes |
+| Complexity | Simpler | More complex |
+| Use when | One primary's capacity is enough | Data or traffic needs multiple shards |
 
-Evenly distributing keys does not guarantee evenly distributed traffic. A very popular key can overload one shard. Mitigations include short-lived application-local caching, replica reads (accepting staleness), splitting hot counters into subkeys, or duplicating read-only values across keys.
+**Remember:** Sentinel watches one primary group. Cluster divides the data across multiple primaries.
 
-## 7. Memory management and eviction
+### Hash tags
 
-Set `maxmemory` and choose an eviction policy deliberately.
+In Cluster, keys used together in a multi-key operation generally need to be in the same hash slot.
 
-| Policy | Behavior |
-|---|---|
-| `noeviction` | Reject writes when memory limit is reached |
-| `allkeys-lru` / `allkeys-lfu` | Evict least-recently / least-frequently used key from all keys |
-| `volatile-lru` / `volatile-lfu` | Evict among keys with TTL |
-| `allkeys-random` / `volatile-random` | Random eviction |
-| `volatile-ttl` | Evict keys with the shortest TTL |
+A hash tag forces related keys into the same slot:
 
-LRU favors recently accessed data; LFU favors frequently accessed data. LFU can protect consistently popular keys from one-off scans, while LRU is a reasonable general cache starting point. Monitor memory use, evictions, hit rate, latency, and rejected writes.
-
-## 8. Common Redis patterns
-
-### Distributed locks
-Acquire a lock with an atomic `SET key token NX EX ttl`. Release it only if the stored token matches the owner token—use a short Lua script for atomic check-and-delete. A lease can expire while work is still running, and a failover can lose lock state. For correctness-critical coordination, consider fencing tokens or a consensus-backed/database mechanism.
-
-### Rate limiting
-- **Fixed window:** counter per identity and time bucket; atomic `INCR` plus TTL. Set expiry safely, often with Lua. Simple, but requests can burst across window boundaries.
-- **Sliding window:** sorted set of request timestamps; remove old entries, count current-window entries, then add the request atomically.
-- **Token bucket:** tracks tokens and refill time; permits bounded bursts while controlling average rate.
-
-```mermaid
-sequenceDiagram
-    participant App
-    participant Redis
-    App->>Redis: Atomic check + increment (Lua)
-    Redis-->>App: Allowed or rejected
-    Note over Redis: Counter / bucket has a TTL
+```text
+cart:{user42}:items
+cart:{user42}:details
 ```
 
-### Leaderboard
-Use a Sorted Set: member = player ID, score = points. Update score and query rank/top-N using sorted-set commands.
+Both keys use `user42` to calculate the slot.
 
-### Session store
-Use a key or Hash with an expiration. Redis provides fast access and automatic expiry; design for re-authentication or session recovery if Redis is unavailable.
+Be careful: putting too much traffic under one hash tag can create a hot shard.
 
-### Cache-aside
-1. Read Redis.
-2. On a hit, return cached data.
-3. On a miss, read the source database, populate Redis with a TTL, and return.
-4. On database updates, update the database and invalidate the cache key.
+## 9. Memory limit and eviction
 
-Deleting on write is often safer than directly overwriting the cache, though races can still briefly reintroduce stale data. TTLs bound stale lifetime.
+RAM is not unlimited. Set a memory limit and decide what Redis should do when it reaches that limit.
 
-Cache stampede mitigations:
-- Single-flight/per-key lock so one request refreshes the value.
-- TTL jitter to spread expirations.
-- Early/background refresh for hot keys.
-- Serve stale data briefly when the product allows it.
+Eviction means **removing keys to make room for new data**.
+
+| Policy | Simple meaning |
+|---|---|
+| `noeviction` | Do not remove keys; reject new writes when memory is full |
+| `allkeys-lru` | Remove a key that was not used recently |
+| `allkeys-lfu` | Remove a key used least often |
+| `volatile-lru` | Apply LRU only to keys that have an expiry |
+| `volatile-lfu` | Apply LFU only to keys that have an expiry |
+| `volatile-ttl` | Prefer keys with the shortest remaining TTL |
+| `allkeys-random` / `volatile-random` | Remove a random eligible key |
+
+- **LRU:** Least Recently Used — “What has not been used lately?”
+- **LFU:** Least Frequently Used — “What is rarely used?”
+
+For a general cache, LRU is a reasonable starting point. LFU can help when a small group of keys is consistently popular.
+
+Monitor memory, evictions, cache hit rate, latency, and rejected writes.
+
+## 10. Common Redis design patterns
+
+### A. Cache-aside — most common cache pattern
+
+The application checks Redis first. If the value is missing, it reads the database and puts the result in Redis.
 
 ```mermaid
 flowchart TD
-    REQ[Read request] --> HIT{Redis cache hit?}
-    HIT -->|Yes| OUT[Return cached value]
-    HIT -->|No| DB[Read source database]
-    DB --> SET[Populate Redis with TTL]
-    SET --> OUT
-    WRITE[Database update] --> DEL[Invalidate cache key]
+    Q[Application asks for data] --> C{Found in Redis?}
+    C -->|Yes: cache hit| OUT[Return data]
+    C -->|No: cache miss| DB[Read database]
+    DB --> SAVE[Save result in Redis with TTL]
+    SAVE --> OUT
+    U[Data is updated] --> D[Update database]
+    D --> INV[Delete related Redis key]
 ```
 
-### Pub/Sub vs Streams
-Pub/Sub is immediate broadcast but messages can be lost when subscribers are disconnected. Streams retain entries and support consumer groups and acknowledgments. For long retention, high-throughput replayable event pipelines, Kafka may be more appropriate.
+Steps to remember:
 
-## 9. Transactions and Lua
+1. Check Redis.
+2. If found, return it.
+3. If missing, read the database.
+4. Save the result in Redis with a TTL.
+5. When data changes, update the database and invalidate the cache.
 
-- `MULTI/EXEC` queues commands and executes them without interleaving from other clients, but Redis transactions do not provide database-style rollback: a runtime command error does not undo other commands.
-- `WATCH` supports optimistic concurrency; clients retry when watched keys change.
-- Lua scripts run atomically on one Redis node and support read/decide/write logic in one round trip. Keep scripts short: they block other commands while running. In Cluster, keys touched by a script must be in the same slot.
+Why delete the cache after a database update? It is often simpler than trying to keep two copies perfectly synchronized. A short stale-data window can still happen, so use TTLs and suitable consistency rules.
 
-Use Lua for atomic rate-limit checks, lock acquisition/release, and small quota updates.
+**Cache stampede:** Many requests find the same key missing or expired and all hit the database together.
 
-## 10. Redis compared with alternatives
+Ways to reduce it:
+- Let one request refresh a key while others wait briefly.
+- Add random variation to TTLs (TTL jitter).
+- Refresh popular keys in the background.
+- Serve slightly old data if the application allows it.
 
-| Technology | Prefer it when |
+### B. Rate limiter
+
+A rate limiter controls how many requests a user can make in a time period.
+
+Example: allow 100 API requests per minute per user.
+
+Redis is useful because many application servers can share the same counter.
+
+Common approaches:
+
+| Algorithm | Easy explanation | Trade-off |
+|---|---|---|
+| Fixed window | Count requests in each time bucket | Simple; can allow a burst at the boundary |
+| Sliding window | Count requests in the last rolling period | More accurate; more work |
+| Token bucket | Refill tokens over time; each request uses one | Allows controlled bursts |
+
+Use atomic Redis operations or a short Lua script so two application servers do not incorrectly update the same limit at the same time.
+
+### C. Distributed lock
+
+A lock allows only one worker to enter a critical section at a time.
+
+A common Redis pattern is:
+
+```text
+SET lock:order:42 unique-token NX EX 30
+```
+
+- `NX`: create the lock only if it does not exist.
+- `EX 30`: give it a 30-second expiry.
+- `unique-token`: identifies the owner.
+
+Release the lock only if the stored token still matches your token. Use a short Lua script to check and delete atomically.
+
+**Important:** A lock can expire while the original worker is still running. Failover can also lose lock state. For correctness-critical work, consider fencing tokens or a stronger coordination mechanism.
+
+### D. Leaderboard
+
+Use a Sorted Set.
+
+- Member = player ID.
+- Score = player points.
+- Redis keeps members ordered by score.
+
+This makes it easy to update a score and ask for the top players or a player's rank.
+
+### E. Session store
+
+Store a session ID and its data in Redis with an expiry.
+
+All application servers can read the same session. If Redis is unavailable or session data is lost, the application should have a recovery or re-login plan.
+
+## 11. Pub/Sub vs Streams
+
+Both help applications communicate, but they solve different problems.
+
+| Pub/Sub | Streams |
 |---|---|
-| Redis | Low-latency derived state, data structures, cache, rate limits, sessions |
-| Memcached | Simple key/blob cache; multithreaded high-QPS get/set may fit |
-| DynamoDB | Durable managed key-value/document primary store |
-| Kafka | Large-scale event streaming, retention, and replay |
-| Database buffer pool | Database’s own hot pages; Redis can still offload app-level reads and return pre-shaped values |
+| Live broadcast | Retained event entries |
+| Subscriber must be listening | Consumer can read later |
+| No message history or replay | Supports reading and replaying retained entries |
+| Good for live notifications | Good for work/event processing |
 
-Redis and a durable database often complement each other rather than replace each other.
+**Remember:**
 
-## Interview checklist
+- Pub/Sub = radio: miss the broadcast and it is gone.
+- Streams = logbook: events are kept so consumers can read them later.
 
-When proposing Redis, explain:
-1. Which access pattern and data structure fit?
-2. Does the working set fit in RAM, and what is the memory budget?
-3. Is Redis a cache, derived state, or the source of truth?
-4. What persistence policy matches acceptable data loss?
-5. What happens during replica lag, failover, eviction, or an outage?
-6. How are cache invalidation and stampedes handled?
-7. Does the design need Sentinel or Cluster, and are there hot keys?
-8. What requires atomicity, and can it be done with a short Lua script?
+For large event pipelines with long retention and extensive replay needs, Kafka may be a better fit.
 
-**Key takeaway:** Redis is not simply “fast.” A strong design names the structure, maps it to the workload, and states the memory, durability, consistency, and failure trade-offs.
+## 12. Transactions and Lua scripts
+
+Redis supports ways to group operations and avoid interference from other clients.
+
+- **MULTI / EXEC:** queue commands and execute them together without another client's commands running in between. This is not the same as a relational database transaction with rollback.
+- **WATCH:** watch keys; if another client changes one, the transaction can be retried.
+- **Lua script:** run a small group of Redis operations atomically on a node.
+
+Use a short Lua script when a decision and update must happen together, such as checking a rate limit and incrementing its counter.
+
+Keep scripts short because they block other commands on that Redis node while running. In Cluster, keys touched by a script must be in the same slot.
+
+## 13. Redis vs other technologies
+
+| Technology | Choose it when |
+|---|---|
+| Redis | Very fast access, cache, counters, sessions, data structures |
+| Memcached | Simple key/value cache |
+| PostgreSQL / MySQL | Durable relational data, joins, transactions |
+| DynamoDB | Managed, durable key-value/document storage |
+| Kafka | Durable event streaming, retention, replay |
+
+Redis and a database usually work **together**. Redis makes common reads faster; the database remains the permanent source of truth.
+
+## 14. Redis interview questions — quick revision
+
+**1. Why is Redis fast?**  
+Because its working data is kept in memory, avoiding disk access for normal reads and writes.
+
+**2. Is Redis single-threaded?**  
+Command execution is largely single-threaded per shard, but Redis can use I/O threads and background threads for other work.
+
+**3. RDB vs AOF?**  
+RDB is a snapshot. AOF records write operations.
+
+**4. What is replication?**  
+Keeping copies of primary data on replica nodes. Replication is normally asynchronous, so replicas can lag.
+
+**5. Sentinel vs Cluster?**  
+Sentinel provides monitoring and failover. Cluster partitions data across multiple primaries and also supports failover.
+
+**6. What is eviction?**  
+Removing keys when Redis reaches its configured memory limit.
+
+**7. What is TTL?**  
+The time after which a key expires.
+
+**8. Pub/Sub vs Streams?**  
+Pub/Sub is live broadcast without message history. Streams retain entries for later consumption.
+
+**9. What is cache-aside?**  
+Read Redis first; on a miss, read the database and populate Redis.
+
+**10. What is a hot key?**  
+A key receiving much more traffic than other keys. It can overload the shard that owns it.
+
+## 15. One-minute Redis revision
+
+Remember these eight points:
+
+1. **Purpose:** Redis is an in-memory data store for fast access.
+2. **Structures:** String, Hash, List, Set, Sorted Set, HyperLogLog, Stream, Pub/Sub.
+3. **Expiry:** TTL removes temporary data automatically.
+4. **Persistence:** RDB = snapshot; AOF = write log.
+5. **Copies:** Replicas copy data, usually asynchronously.
+6. **Availability:** Sentinel monitors and promotes a replica.
+7. **Scaling:** Cluster splits keys across 16,384 hash slots.
+8. **Memory:** Eviction removes eligible keys when memory is full.
+
+### The interview answer formula
+
+When someone asks, “How would you use Redis in this design?”, answer in this order:
+
+1. **What data?** Name the data you want to store.
+2. **Which structure?** String, Hash, Sorted Set, Stream, etc.
+3. **How long?** Define TTL and persistence needs.
+4. **How much traffic?** Estimate memory and read/write load.
+5. **What if it fails?** Explain replicas, failover, and database fallback.
+6. **How will it scale?** Discuss Cluster and hot keys if needed.
+
+**Key takeaway:** Do not just say “Redis is fast.” Explain which Redis feature fits the problem, why it fits, and what happens when memory, a node, or the network fails.
 
 ---
-*These notes are based on the provided Redis material, reorganized into interview-focused study notes. Examples and diagrams are explanatory aids.*
+
+*Distributed Systems Study Library · Author: Jayesh Sharma*
